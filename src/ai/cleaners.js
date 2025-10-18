@@ -1,7 +1,11 @@
 // src/ai/cleaners.js
 // Title/metadata cleaners for RapidApply SA
-// v4: fixes QA/QC slash, AutoCAD casing, 'QS' acronym, 'in Saudi' -> 'in Saudi Arabia',
-// preserves punctuation, balances parentheses, and safer titlecase.
+// v5: keeps your full cleaner behavior & adds summarizeSnippet (fail-open if no API key).
+
+import 'openai/shims/node';
+import OpenAI from 'openai';
+
+const openai = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
 
 const he = {
   decode: (s) =>
@@ -199,9 +203,44 @@ export function cleanLocation(input) {
   return s;
 }
 
-// Convenience wrapper used by pipeline
+/**
+ * Summarize a job snippet into a single short sentence.
+ * - Uses OpenAI if OPENAI_API_KEY is set; otherwise returns ''.
+ * - Keeps the pipeline robust on failure (fail-open).
+ */
+export async function summarizeSnippet(text) {
+  try {
+    if (!openai) return '';
+    const raw = String(text || '').slice(0, 3000);
+    if (!raw.trim()) return '';
+
+    const res = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      temperature: 0.2,
+      max_tokens: 60,
+      messages: [
+        {
+          role: 'system',
+          content:
+            'You write ultra-brief, single-sentence summaries for job ads. No emojis, no bullets, <= 25 words. Keep it factual and role-focused.',
+        },
+        {
+          role: 'user',
+          content: `Summarize this job ad in one short sentence:\n\n${raw}`,
+        },
+      ],
+    });
+
+    return res.choices?.[0]?.message?.content?.trim() || '';
+  } catch (err) {
+    return '';
+  }
+}
+
+// Default export (optional aggregation)
 export default {
   cleanTitle,
   cleanCategory,
   cleanLocation,
+  summarizeSnippet,
 };
