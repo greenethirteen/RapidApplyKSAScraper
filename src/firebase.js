@@ -1,51 +1,66 @@
-import fs from 'fs';
-import path from 'path';
-import admin from 'firebase-admin';
+// src/firebase.js
+import fs from "fs";
+import path from "path";
+import admin from "firebase-admin";
 
-const PROJECT_ID  = process.env.PROJECT_ID || process.env.FIREBASE_PROJECT_ID || 'sojoblessbh-d7b54';
-const DATABASE_URL = process.env.DATABASE_URL || `https://${PROJECT_ID}-default-rtdb.firebaseio.com`;
+let db = null;
+let initTried = false;
 
-function readLocalServiceAccount() {
-  const p = path.join(process.cwd(), 'serviceAccount.json');
-  if (fs.existsSync(p)) {
-    try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch {}
+export async function initFirebase() {
+  if (initTried) return db;
+  initTried = true;
+
+  // Allow opting out completely
+  if (process.env.FIREBASE_DISABLED === "1") {
+    console.log("[firebase] writing disabled via FIREBASE_DISABLED=1");
+    return null;
   }
-  return null;
-}
 
-function resolveCredential() {
-  // 1) Full JSON in one env var
-  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+  // Try service account first (local dev)
+  let credential = null;
+  let projectId = process.env.PROJECT_ID || process.env.FIREBASE_PROJECT_ID || undefined;
+  let databaseURL = process.env.DATABASE_URL || (projectId ? `https://${projectId}-default-rtdb.firebaseio.com` : undefined);
+
+  const saPath = process.env.GOOGLE_APPLICATION_CREDENTIALS || path.resolve(process.cwd(), "serviceAccount.json");
+  if (fs.existsSync(saPath)) {
     try {
-      const json = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-      return admin.credential.cert(json);
+      const sa = JSON.parse(fs.readFileSync(saPath, "utf8"));
+      credential = admin.credential.cert(sa);
+      projectId = projectId || sa.project_id;
+      databaseURL = databaseURL || `https://${projectId}-default-rtdb.firebaseio.com`;
     } catch (e) {
-      console.warn('[firebase] Could not parse FIREBASE_SERVICE_ACCOUNT JSON:', e?.message || e);
+      console.warn("[firebase] could not read serviceAccount.json:", e.message);
+    }
+  } else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+    console.warn(`[firebase] GOOGLE_APPLICATION_CREDENTIALS set but file not found: ${saPath}`);
+  }
+
+  // Fallback to ADC (works on GCP/Cloud Run), but prints friendly errors locally
+  if (!credential) {
+    try {
+      credential = admin.credential.applicationDefault();
+    } catch (e) {
+      console.warn("[firebase] applicationDefault() unavailable. Provide serviceAccount.json or set FIREBASE_DISABLED=1 for dry-run.");
+      return null;
     }
   }
-  // 2) Split env vars (easy to paste)
-  if (process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
-    const key = process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n');
-    return admin.credential.cert({
-      project_id: PROJECT_ID,
-      client_email: process.env.FIREBASE_CLIENT_EMAIL,
-      private_key: key,
-    });
+
+  if (!databaseURL) {
+    console.warn("[firebase] DATABASE_URL not set and could not infer from PROJECT_ID. Skipping writes.");
+    return null;
   }
-  // 3) Local file in repo root
-  const local = readLocalServiceAccount();
-  if (local) return admin.credential.cert(local);
 
-  // 4) GOOGLE_APPLICATION_CREDENTIALS or GCP metadata
-  return admin.credential.applicationDefault();
+  try {
+    admin.initializeApp({ credential, databaseURL });
+    db = admin.database();
+    console.log("[firebase] initialized");
+  } catch (e) {
+    console.warn("[firebase] init failed:", e.message);
+    db = null;
+  }
+  return db;
 }
 
-function initAdmin() {
-  if (admin.apps.length) return admin;
-  const cred = resolveCredential();
-  admin.initializeApp({ credential: cred, databaseURL: DATABASE_URL });
-  return admin;
+export function getDb() {
+  return db;
 }
-
-export const adminApp = initAdmin();
-export const db = admin.database();

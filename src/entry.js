@@ -1,6 +1,10 @@
 // src/entry.js
-// Ensure env is loaded + AI guard runs before anything else.
-import "dotenv/config";
-import "./force-normalizer.js";
-// Then boot your existing app (no changes needed elsewhere).
-import "./index.js";
+// Loads .env automatically and starts the scraper.
+// Usage: node src/entry.js   (no need for -r dotenv/config)
+import 'dotenv/config';
+import { run } from './index.js';
+
+run().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

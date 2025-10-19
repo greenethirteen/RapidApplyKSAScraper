@@ -1,54 +1,43 @@
-// src/pipeline.js
-// Drop-in email-aware pipeline helpers. ESM compatible.
-// Exports `aiCleanupAndWrite` to remain compatible with earlier imports.
+import fetch from "node-fetch";
+import { load } from "cheerio";
+import {
+  cleanTitle,
+  cleanCategory,
+  cleanLocation,
+  ensureTitle,
+} from "./ai/cleaners.js";
 
-import * as cheerio from "cheerio";
-import { extractEmails } from "./email/extract.js";
+export async function fetchJobListPage(url) {
+  const res = await fetch(url);
+  const html = await res.text();
+  const $ = load(html);
 
-/**
- * Build a record with emails extracted from the job details HTML.
- * This function does not perform network I/O; it assumes you already fetched the page HTML.
- * It is safe to call even if `html` is empty.
- */
-export function buildRecordWithEmails({
-  html = "",
-  url = "",
-  title = "",
-  category = "",
-  location = "Saudi Arabia",
-  id = "",
-  extra = {},
-}) {
-  let emails = [];
-  try {
-    const $ = html ? cheerio.load(html) : null;
-    emails = extractEmails(html || "", $ || null);
-  } catch (e) {
-    // cheerio might fail on malformed HTML; ignore and fallback to regex
-    emails = extractEmails(html || "", null);
-  }
-
-  const record = {
-    title: (title || "").toString().trim(),
-    category: (category || "").toString().trim(),
-    location: (location || "").toString().trim() || "Saudi Arabia",
-    url,
-    id,
-    emails, // <= NEW
-    ...extra,
-  };
-  return record;
+  const links = [];
+  $("a").each((_, a) => {
+    const href = $(a).attr("href") || "";
+    if (href.includes("/job-details?jobid=")) {
+      try {
+        const absolute = new URL(href, url).toString();
+        links.push(absolute);
+      } catch {}
+    }
+  });
+  return [...new Set(links)];
 }
 
-/**
- * Backwards-compatible export used by some entrypoints:
- * Given a raw job object and HTML, return a normalized record ready to persist.
- * Usage in existing code: const rec = await aiCleanupAndWrite({ html, url, ...meta })
- */
-export async function aiCleanupAndWrite(args) {
-  // Keep name for compatibility; we only build the record here.
-  // If your previous version wrote directly to Firebase, do that right after calling this.
-  return buildRecordWithEmails(args || {});
-}
+export async function fetchJobDetail(url) {
+  const res = await fetch(url);
+  const html = await res.text();
+  const $ = load(html);
 
-export default { buildRecordWithEmails, aiCleanupAndWrite };
+  const rawTitle = $("h1, .job-title, title").first().text();
+  const title = ensureTitle(rawTitle);
+  const category = cleanCategory(
+    $(".category, .job-category").first().text() || ""
+  );
+  const location = cleanLocation(
+    $(".location, .job-location").first().text() || "Saudi Arabia"
+  );
+
+  return { html, title, category, location };
+}
