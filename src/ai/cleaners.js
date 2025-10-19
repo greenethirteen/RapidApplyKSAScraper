@@ -1,134 +1,114 @@
 // src/ai/cleaners.js
-// Purpose: Clean and normalize job titles using OpenAI, reading API key from ENV ONLY.
-// IMPORTANT: No hardcoded keys; production relies on Railway -> Variables -> OPENAI_API_KEY
-
+// OpenAI-only cleaners — no heuristic fallback.
 import OpenAI from "openai";
 
-/** Utility: basic HTML to text (very lightweight) */
-function htmlToText(html = "") {
-  if (!html) return "";
-  // Remove scripts/styles
-  html = html.replace(/<script[\s\S]*?<\/script>/gi, " ");
-  html = html.replace(/<style[\s\S]*?<\/style>/gi, " ");
-  // Replace <br> and block tags with newlines
-  html = html.replace(/<(?:br|BR)\s*\/?>/g, "\n");
-  html = html.replace(/<\/(?:p|div|li|ul|ol|h[1-6])>/gi, "\n");
-  // Strip all remaining tags
-  html = html.replace(/<[^>]+>/g, " ");
-  // Collapse whitespace
-  return html.replace(/\s+/g, " ").trim();
+const key = process.env.OPENAI_API_KEY?.trim();
+if (!key) {
+  throw new Error("[Fatal] OPENAI_API_KEY is required (AI mandatory).");
 }
+export const openai = new OpenAI({ apiKey: key });
 
-/** Heuristic fallback cleaner in case the API fails */
-function fallbackTitle(rawTitle = "", bodyText = "") {
-  const t = (rawTitle || "").trim();
-  // If title is long or generic, try to extract a role-like phrase from the body
-  const tooGeneric = /urgent|hiring|requirement|vacancies|positions|opportunities|opening|we\s*are\s*looking|job\s*vacancy/i;
-  let candidate = t;
-  if (!t || t.length < 3 || tooGeneric.test(t)) {
-    // Look for lines like "Position: XXX", bullets, or short role-like fragments
-    const m =
-      bodyText.match(/(?:position\s*:\s*|role\s*:\s*)([A-Za-z0-9\-/&(),\. ]{3,80})/i) ||
-      bodyText.match(/\b([A-Z][A-Za-z /&\-]{2,60}?\b(?:Engineer|Supervisor|Manager|Inspector|Coordinator|Controller|Technician|Planner|Estimator|Draftsman|Operator|Foreman|Architect|Surveyor|Specialist|Analyst|Consultant|Executive))\b/i);
-    if (m) candidate = m[1].trim();
-  }
-  // Trim trailing garbage like dashes or punctuation
-  candidate = (candidate || "").replace(/^[-–:]+\s*/, "").replace(/\s*[-–:,\.]\s*$/,"").trim();
-  // Capitalize simple patterns
-  if (candidate && candidate.length <= 80) return candidate;
-  return t.slice(0, 80);
-}
+const MODEL = process.env.OPENAI_MODEL?.trim() || "gpt-4o-mini";
 
-/** Strict post-processor to ensure we keep only the role words */
-function strictTrimRole(s = "") {
-  if (!s) return s;
-  // Remove leading emojis/quotes/brackets and marketing fluff
-  s = s.replace(/^[^A-Za-z0-9]+/, "");
-  s = s.replace(/\b(urgent|hiring|required|requirement|vacancy|job|opportunity|opportunities|multiple|opening|openings|positions|we are looking for|looking for)\b[,:\- ]*/gi, "");
-  // Drop trailing counts and location tails
-  s = s.replace(/\b\(?\s*\d+\s*(?:nos|ea|positions?)\s*\)?$/i, "");
-  s = s.replace(/\b(in|at|for)\s+[A-Za-z ,\-]+$/i, "").trim();
-  // Collapse spaces and trim punctuation
-  s = s.replace(/\s+/g, " ").replace(/^[-–:]+\s*/, "").replace(/\s*[-–:,\.]\s*$/,"").trim();
-  // If after trimming it's too short, return empty so caller can fallback
-  if (s.length < 2) return "";
-  return s;
-}
-
-/**
- * Clean a job title using OpenAI with a strict JSON response format.
- * Returns { title, meta }, where title is a single role-only string (<= 80 chars).
- */
-export async function cleanTitle({ rawTitle = "", bodyHtml = "", url = "" }) {
-  const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-  if (!OPENAI_API_KEY) {
-    throw new Error("OPENAI_API_KEY is required (Railway Variables). No hardcoded keys allowed.");
-  }
-
-  const client = new OpenAI({ apiKey: OPENAI_API_KEY });
-  const bodyText = htmlToText(bodyHtml).slice(0, 6000); // keep prompt smallish
-
-  const system = `You extract *only the job title* from messy headlines/descriptions.
-Rules (must follow):
-- Output a single concise role like "Civil Engineer" (<= 80 chars).
-- NO company names, locations, seniority symbols, counts, or marketing words.
-- If headline is generic (e.g., "Urgent Hiring"), derive the title from the body text.
-- If the page clearly lists multiple roles, return the token MULTI_ROLE_HEADING.
-- Return JSON ONLY: {"title": "<string>", "note": "<optional>"} (no backticks).`;
-
-  const user = JSON.stringify({
-    url,
-    headline: rawTitle,
-    body_excerpt: bodyText.slice(0, 2000)
-  });
-
-  let aiTitle = "";
-  let note = "";
-  try {
-    const resp = await client.responses.create({
-      model: "gpt-4o-mini",
-      temperature: 0.2,
-      response_format: { type: "json_object" },
-      input: [
-        { role: "system", content: system },
-        { role: "user", content: user }
-      ]
-    });
-
-    const content = resp?.output_text || resp?.content?.[0]?.text || "";
-    let parsed;
+async function callOpenAI(system, user, max_tokens = 200) {
+  let lastErr;
+  for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      parsed = JSON.parse(content);
-    } catch {
-      // Some SDKs put text in a different place; last resort grab text blocks
-      const textChunk = (resp?.content || [])
-        .map(c => (typeof c?.text === "string" ? c.text : ""))
-        .join("\n");
-      parsed = JSON.parse(textChunk || "{}");
+      const resp = await openai.chat.completions.create({
+        model: MODEL,
+        temperature: 0.2,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: user }
+        ],
+        max_tokens
+      });
+      const text = resp?.choices?.[0]?.message?.content?.trim();
+      if (text) return text;
+      throw new Error("Empty OpenAI response");
+    } catch (e) {
+      lastErr = e;
+      await new Promise(r => setTimeout(r, 150 * attempt));
     }
-    aiTitle = strictTrimRole(parsed?.title || "");
-    note = parsed?.note || "";
-  } catch (e) {
-    // fall back to heuristic
-    aiTitle = "";
   }
+  throw lastErr || new Error("OpenAI call failed");
+}
 
-  if (!aiTitle) {
-    const t = fallbackTitle(rawTitle, bodyText);
-    aiTitle = strictTrimRole(t) || t;
+export function safeText(v) {
+  if (v == null) return "";
+  if (typeof v === "string") return v;
+  if (Array.isArray(v)) return v.filter(Boolean).join(" ").trim();
+  return String(v ?? "").trim();
+}
+
+export async function ensureTitle(possibleTitle = "", bodyText = "") {
+  possibleTitle = safeText(possibleTitle);
+  bodyText = safeText(bodyText);
+  const sys = "Infer a precise professional job title if missing/weak. Output only Title Case text.";
+  const usr = `Given Title: ${possibleTitle || "(none)"}\nBody: ${bodyText}`;
+  const out = await callOpenAI(sys, usr, 50);
+  return out.replace(/\s+/g, " ").trim();
+}
+
+export async function cleanTitle(rawTitle = "", bodyText = "") {
+  rawTitle = safeText(rawTitle);
+  bodyText = safeText(bodyText);
+  const sys = "Normalize job titles. Output only the final Title Case role (no fluff, no location, no urgency, no punctuation).";
+  const usr = `Raw Title: ${rawTitle}\nBody: ${bodyText}`;
+  const out = await callOpenAI(sys, usr, 50);
+  return out.replace(/\s+/g, " ").trim();
+}
+
+export async function cleanLocation(rawTitle = "", bodyText = "") {
+  rawTitle = safeText(rawTitle);
+  bodyText = safeText(bodyText);
+  const sys = "Extract location. Output only city or 'Saudi Arabia'. If unknown, return 'Saudi Arabia'.";
+  const usr = `Title: ${rawTitle}\nBody: ${bodyText}`;
+  const out = await callOpenAI(sys, usr, 30);
+  return out.replace(/\s+/g, " ").trim() || "Saudi Arabia";
+}
+
+export async function summarizeSnippet(bodyText = "") {
+  bodyText = safeText(bodyText);
+  const sys = "Return one concise sentence (<=30 words) summarizing role & key requirements. No headings or lists.";
+  const usr = `Body:\n${bodyText}`;
+  const out = await callOpenAI(sys, usr, 80);
+  return out.replace(/\s+/g, " ").trim();
+}
+
+export async function guessCategory(cleanedTitle = "", bodyText = "") {
+  cleanedTitle = safeText(cleanedTitle);
+  bodyText = safeText(bodyText);
+  const sys = "Classify role into ONE of: Civil Engineering, Electrical (Power/ELV), Mechanical (MEP), HSE & Safety, QA/QC, Project Management, Procurement, Planning, General Engineering, Other. Output the category only.";
+  const usr = `Title: ${cleanedTitle}\nBody: ${bodyText}`;
+  const out = await callOpenAI(sys, usr, 22);
+  return out.replace(/\s+/g, " ").trim();
+}
+
+export async function extractEmailsAI(bodyText = "") {
+  bodyText = safeText(bodyText);
+  const sys = "Extract valid emails. Output JSON array of unique lowercase emails, [] if none.";
+  const usr = `Text:\n${bodyText}`;
+  const out = await callOpenAI(sys, usr, 120);
+  try {
+    const s = out.indexOf("["), e = out.lastIndexOf("]");
+    if (s >= 0 && e > s) {
+      const arr = JSON.parse(out.slice(s, e+1));
+      const uniq = Array.from(new Set(arr.map(x => String(x).trim().toLowerCase())));
+      return uniq;
+    }
+  } catch {}
+  const regex = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
+  const fallback = bodyText.match(regex) || [];
+  return Array.from(new Set(fallback.map(e => e.toLowerCase())));
+}
+
+// doctor helper for quick key preflight
+export async function __doctor() {
+  try {
+    const txt = await callOpenAI("Health check", "Reply with OK", 3);
+    return /ok/i.test(txt);
+  } catch {
+    return false;
   }
-
-  // Final guardrails
-  aiTitle = aiTitle
-    .replace(/\b(saudi arabia|riyadh|jeddah|dammam|makkah|madinah)\b/gi, "")
-    .replace(/\s+/g, " ")
-    .replace(/^[-–:]+\s*/, "")
-    .replace(/\s*[-–:,\.]\s*$/,"")
-    .trim();
-
-  if (!aiTitle || aiTitle.length < 2) {
-    aiTitle = fallbackTitle(rawTitle, bodyText);
-  }
-
-  return { title: aiTitle, meta: { note, from: "ai" } };
 }

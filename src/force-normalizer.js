@@ -1,8 +1,20 @@
 // src/force-normalizer.js
-// Force the AI normalizer ON in any environment (Railway cron/job, dev, etc.)
-// Import this once at the very top of your entrypoint:  import "./force-normalizer.js";
+// Load .env and enforce AI ON; fail fast if OPENAI_API_KEY is missing.
+import "dotenv/config";
 
-process.env.ENABLE_AI_NORMALIZER = '1';
-if (process.env.NODE_ENV !== 'test') {
-  console.log("[Normalizer] ENABLE_AI_NORMALIZER forced to 1");
+const key = process.env.OPENAI_API_KEY?.trim();
+if (!key) {
+  console.error(
+    "[Fatal] OPENAI_API_KEY is required.\n" +
+    "• Local: export OPENAI_API_KEY=sk-...\n" +
+    "• Railway: add OPENAI_API_KEY in Variables\n"
+  );
+  process.exit(1);
+}
+
+// Lock the feature ON (cannot be disabled by env)
+process.env.ENABLE_AI_NORMALIZER = "1";
+
+if (process.env.NODE_ENV !== "test") {
+  console.log("[AI] Mandatory mode: ENABLE_AI_NORMALIZER=1 (cannot be turned off)");
 }

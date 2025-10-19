@@ -1,3 +1,4 @@
+import './force-normalizer.js';
 import 'dotenv/config';
 import runSaudiScraper from './scrapers/saudiJobsScraper.js';
 import { aiCleanupAndWrite } from './pipeline.js';
