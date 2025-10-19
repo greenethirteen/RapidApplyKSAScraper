@@ -1,246 +1,134 @@
 // src/ai/cleaners.js
-// Title/metadata cleaners for RapidApply SA
-// v5: keeps your full cleaner behavior & adds summarizeSnippet (fail-open if no API key).
+// Purpose: Clean and normalize job titles using OpenAI, reading API key from ENV ONLY.
+// IMPORTANT: No hardcoded keys; production relies on Railway -> Variables -> OPENAI_API_KEY
 
-import 'openai/shims/node';
-import OpenAI from 'openai';
+import OpenAI from "openai";
 
-const openai = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
-
-const he = {
-  decode: (s) =>
-    s
-      .replace(/&amp;/g, "&")
-      .replace(/&quot;/g, '"')
-      .replace(/&#39;|&apos;/g, "'")
-      .replace(/&nbsp;/g, " ")
-      .replace(/&ndash;|&#8211;/g, "–")
-      .replace(/&mdash;|&#8212;/g, "—")
-      .replace(/&lt;/g, "<")
-      .replace(/&gt;/g, ">"),
-};
-
-const ACRONYMS = new Set([
-  "QA", "QC", "QA/QC", "QS",
-  "HSE", "ELV", "HVAC", "MEP", "PMO", "QAQC",
-  "ARASCO", "KSA", "SAP", "CAD"
-]);
-
-const PROPER_CASE_OVERRIDES = new Map([
-  ["Autocad", "AutoCAD"],
-  ["Autocad,", "AutoCAD,"],
-  ["Autocad.", "AutoCAD."],
-  ["Qa", "QA"],
-  ["Qc", "QC"],
-  ["Qa/Qc", "QA/QC"],
-  ["Qa Qc", "QA QC"],
-  ["Qs", "QS"],
-  ["Elv", "ELV"],
-  ["Hse", "HSE"],
-  ["Qa Qc Engineer", "QA/QC Engineer"],
-]);
-
-const SMALL_WORDS = new Set([
-  "a","an","and","as","at","but","by","for","in","of","on","or","per","the","to","vs","via","with"
-]);
-
-const SAUDI_FIXES = [
-  { re: /\bJobs in Saudi\b/gi, rep: "Jobs in Saudi Arabia" },
-  { re: /\bin Saudi\b/gi, rep: "in Saudi Arabia" },
-  { re: /\b–\s*Saudi\b/gi, rep: "– Saudi Arabia" },
-];
-
-function smartifyDashes(s) {
-  // normalize hyphen-like sequences to en dashes where appropriate around words/spaces
-  return s
-    .replace(/\s*--\s*/g, " – ")
-    .replace(/\s+-\s+/g, " – ")
-    .replace(/\s+–\s+/g, " – ")
-    .replace(/\s+—\s+/g, " — ");
+/** Utility: basic HTML to text (very lightweight) */
+function htmlToText(html = "") {
+  if (!html) return "";
+  // Remove scripts/styles
+  html = html.replace(/<script[\s\S]*?<\/script>/gi, " ");
+  html = html.replace(/<style[\s\S]*?<\/style>/gi, " ");
+  // Replace <br> and block tags with newlines
+  html = html.replace(/<(?:br|BR)\s*\/?>/g, "\n");
+  html = html.replace(/<\/(?:p|div|li|ul|ol|h[1-6])>/gi, "\n");
+  // Strip all remaining tags
+  html = html.replace(/<[^>]+>/g, " ");
+  // Collapse whitespace
+  return html.replace(/\s+/g, " ").trim();
 }
 
-function balanceParens(s) {
-  const open = (s.match(/\(/g) || []).length;
-  const close = (s.match(/\)/g) || []).length;
-  if (open > close) {
-    // append missing closers at end
-    return s + ")".repeat(open - close);
+/** Heuristic fallback cleaner in case the API fails */
+function fallbackTitle(rawTitle = "", bodyText = "") {
+  const t = (rawTitle || "").trim();
+  // If title is long or generic, try to extract a role-like phrase from the body
+  const tooGeneric = /urgent|hiring|requirement|vacancies|positions|opportunities|opening|we\s*are\s*looking|job\s*vacancy/i;
+  let candidate = t;
+  if (!t || t.length < 3 || tooGeneric.test(t)) {
+    // Look for lines like "Position: XXX", bullets, or short role-like fragments
+    const m =
+      bodyText.match(/(?:position\s*:\s*|role\s*:\s*)([A-Za-z0-9\-/&(),\. ]{3,80})/i) ||
+      bodyText.match(/\b([A-Z][A-Za-z /&\-]{2,60}?\b(?:Engineer|Supervisor|Manager|Inspector|Coordinator|Controller|Technician|Planner|Estimator|Draftsman|Operator|Foreman|Architect|Surveyor|Specialist|Analyst|Consultant|Executive))\b/i);
+    if (m) candidate = m[1].trim();
   }
-  return s;
+  // Trim trailing garbage like dashes or punctuation
+  candidate = (candidate || "").replace(/^[-–:]+\s*/, "").replace(/\s*[-–:,\.]\s*$/,"").trim();
+  // Capitalize simple patterns
+  if (candidate && candidate.length <= 80) return candidate;
+  return t.slice(0, 80);
 }
 
-function normalizeWhitespace(s) {
-  return s.replace(/\s+/g, " ").trim();
-}
-
-function capitalizeWord(w) {
-  if (!w) return w;
-  // keep all-uppercase words as is (acronyms)
-  if (ACRONYMS.has(w.toUpperCase())) return w.toUpperCase();
-  // keep numeric tokens or tokens with digits/hyphens
-  if (/[0-9]/.test(w)) return w;
-  // mixed words like QA/QC
-  if (w.includes("/")) {
-    return w.split("/").map(capitalizeWord).join("/");
-  }
-  // keep camel-cased words
-  if (/^[A-Z][a-z]+[A-Z]/.test(w)) return w;
-  // titlecase basic
-  return w[0].toUpperCase() + w.slice(1).toLowerCase();
-}
-
-function titleCase(s) {
-  const parts = s.split(/(\s+)/); // keep spaces
-  let wordIdx = 0;
-  return parts
-    .map((part) => {
-      if (part.trim() === "") return part;
-      const raw = part;
-
-      // keep known acronyms & overrides
-      const override = PROPER_CASE_OVERRIDES.get(raw);
-      if (override) return override;
-
-      const word = raw.replace(/^[("'\[]+|[)"'\].,:;!?]+$/g, ""); // strip leading/trailing punct for decision
-      const lead = raw.slice(0, raw.indexOf(word));
-      const trail = raw.slice(lead.length + word.length);
-
-      let cased;
-      if (wordIdx > 0 && wordIdx < s.split(/\s+/).length - 1 && SMALL_WORDS.has(word.toLowerCase())) {
-        cased = word.toLowerCase();
-      } else {
-        cased = capitalizeWord(word);
-      }
-      wordIdx += 1;
-
-      // re-attach punctuation
-      const merged = (lead || "") + cased + (trail || "");
-
-      // second pass overrides (handles punctuation-attached tokens)
-      for (const [k, v] of PROPER_CASE_OVERRIDES) {
-        if (merged === k) return v;
-      }
-      return merged;
-    })
-    .join("");
-}
-
-function normalizeQAQC(s) {
-  // Various forms to canonical "QA/QC"
-  return s
-    .replace(/\bQA\s*\/\s*QC\b/gi, "QA/QC")
-    .replace(/\bQA\s*QC\b/gi, "QA/QC")
-    .replace(/\bQa\s*\/\s*Qc\b/g, "QA/QC")
-    .replace(/\bQa\s*Qc\b/g, "QA/QC");
-}
-
-function properNouns(s) {
-  // Specific site/location/name fixes that shouldn't be lowercased
-  return s
-    .replace(/\bRas\s+Tanura(h)?\b/gi, "Ras Tanurah")
-    .replace(/\bSaudi\b/g, "Saudi Arabia");
-}
-
-export function cleanTitle(input) {
-  if (!input) return "";
-
-  let s = String(input);
-  s = he.decode(s);
-  s = s.replace(/\u00A0/g, " "); // nbsp
-  s = normalizeWhitespace(s);
-  s = smartifyDashes(s);
-  s = normalizeQAQC(s);
-
-  // Saudi phrasing fixes
-  for (const { re, rep } of SAUDI_FIXES) s = s.replace(re, rep);
-
-  // ensure AutoCAD casing
-  s = s.replace(/\bAutocad\b/gi, "AutoCAD");
-
-  // Make sure "QS" is uppercase when used as role
-  s = s.replace(/\bQs\b/g, "QS");
-
-  // Proper nouns & geography
-  s = properNouns(s);
-
-  // Title case with small-word rules & overrides
-  s = titleCase(s);
-
-  // If a title ends like "(civil" etc., try to capitalize inner content and close paren
-  s = s.replace(/\(([^)]+)$/g, (m, inner) => `(${titleCase(inner)})`);
-  s = balanceParens(s);
-
-  // Trim trailing dangling punctuation like " –", ":"; keep if meaningful
-  s = s.replace(/\s+[-–—:]$/g, "").trim();
-
-  return s;
-}
-
-// Category normalization if needed later
-const CATEGORY_ALIASES = new Map([
-  ["HSE & Safety", "HSE & Safety"],
-  ["Civil", "Civil Engineering"],
-  ["Electrical", "Electrical Engineering"],
-  ["Procurement", "Procurement"],
-  ["Document Control", "Document Control & Admin"],
-]);
-
-export function cleanCategory(input) {
-  if (!input) return "";
-  let s = normalizeWhitespace(he.decode(String(input)));
-  // Apply simple alias mapping
-  const hit = CATEGORY_ALIASES.get(s) || CATEGORY_ALIASES.get(titleCase(s));
-  return hit || titleCase(s);
-}
-
-export function cleanLocation(input) {
-  if (!input) return "";
-  let s = normalizeWhitespace(he.decode(String(input)));
-  // Expand "Saudi" -> "Saudi Arabia"
-  s = s.replace(/\bSaudi\b/g, "Saudi Arabia");
-  // Canonicalize KSA
-  s = s.replace(/\bKSA\b/g, "Saudi Arabia");
+/** Strict post-processor to ensure we keep only the role words */
+function strictTrimRole(s = "") {
+  if (!s) return s;
+  // Remove leading emojis/quotes/brackets and marketing fluff
+  s = s.replace(/^[^A-Za-z0-9]+/, "");
+  s = s.replace(/\b(urgent|hiring|required|requirement|vacancy|job|opportunity|opportunities|multiple|opening|openings|positions|we are looking for|looking for)\b[,:\- ]*/gi, "");
+  // Drop trailing counts and location tails
+  s = s.replace(/\b\(?\s*\d+\s*(?:nos|ea|positions?)\s*\)?$/i, "");
+  s = s.replace(/\b(in|at|for)\s+[A-Za-z ,\-]+$/i, "").trim();
+  // Collapse spaces and trim punctuation
+  s = s.replace(/\s+/g, " ").replace(/^[-–:]+\s*/, "").replace(/\s*[-–:,\.]\s*$/,"").trim();
+  // If after trimming it's too short, return empty so caller can fallback
+  if (s.length < 2) return "";
   return s;
 }
 
 /**
- * Summarize a job snippet into a single short sentence.
- * - Uses OpenAI if OPENAI_API_KEY is set; otherwise returns ''.
- * - Keeps the pipeline robust on failure (fail-open).
+ * Clean a job title using OpenAI with a strict JSON response format.
+ * Returns { title, meta }, where title is a single role-only string (<= 80 chars).
  */
-export async function summarizeSnippet(text) {
-  try {
-    if (!openai) return '';
-    const raw = String(text || '').slice(0, 3000);
-    if (!raw.trim()) return '';
+export async function cleanTitle({ rawTitle = "", bodyHtml = "", url = "" }) {
+  const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+  if (!OPENAI_API_KEY) {
+    throw new Error("OPENAI_API_KEY is required (Railway Variables). No hardcoded keys allowed.");
+  }
 
-    const res = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
+  const client = new OpenAI({ apiKey: OPENAI_API_KEY });
+  const bodyText = htmlToText(bodyHtml).slice(0, 6000); // keep prompt smallish
+
+  const system = `You extract *only the job title* from messy headlines/descriptions.
+Rules (must follow):
+- Output a single concise role like "Civil Engineer" (<= 80 chars).
+- NO company names, locations, seniority symbols, counts, or marketing words.
+- If headline is generic (e.g., "Urgent Hiring"), derive the title from the body text.
+- If the page clearly lists multiple roles, return the token MULTI_ROLE_HEADING.
+- Return JSON ONLY: {"title": "<string>", "note": "<optional>"} (no backticks).`;
+
+  const user = JSON.stringify({
+    url,
+    headline: rawTitle,
+    body_excerpt: bodyText.slice(0, 2000)
+  });
+
+  let aiTitle = "";
+  let note = "";
+  try {
+    const resp = await client.responses.create({
+      model: "gpt-4o-mini",
       temperature: 0.2,
-      max_tokens: 60,
-      messages: [
-        {
-          role: 'system',
-          content:
-            'You write ultra-brief, single-sentence summaries for job ads. No emojis, no bullets, <= 25 words. Keep it factual and role-focused.',
-        },
-        {
-          role: 'user',
-          content: `Summarize this job ad in one short sentence:\n\n${raw}`,
-        },
-      ],
+      response_format: { type: "json_object" },
+      input: [
+        { role: "system", content: system },
+        { role: "user", content: user }
+      ]
     });
 
-    return res.choices?.[0]?.message?.content?.trim() || '';
-  } catch (err) {
-    return '';
+    const content = resp?.output_text || resp?.content?.[0]?.text || "";
+    let parsed;
+    try {
+      parsed = JSON.parse(content);
+    } catch {
+      // Some SDKs put text in a different place; last resort grab text blocks
+      const textChunk = (resp?.content || [])
+        .map(c => (typeof c?.text === "string" ? c.text : ""))
+        .join("\n");
+      parsed = JSON.parse(textChunk || "{}");
+    }
+    aiTitle = strictTrimRole(parsed?.title || "");
+    note = parsed?.note || "";
+  } catch (e) {
+    // fall back to heuristic
+    aiTitle = "";
   }
-}
 
-// Default export (optional aggregation)
-export default {
-  cleanTitle,
-  cleanCategory,
-  cleanLocation,
-  summarizeSnippet,
-};
+  if (!aiTitle) {
+    const t = fallbackTitle(rawTitle, bodyText);
+    aiTitle = strictTrimRole(t) || t;
+  }
+
+  // Final guardrails
+  aiTitle = aiTitle
+    .replace(/\b(saudi arabia|riyadh|jeddah|dammam|makkah|madinah)\b/gi, "")
+    .replace(/\s+/g, " ")
+    .replace(/^[-–:]+\s*/, "")
+    .replace(/\s*[-–:,\.]\s*$/,"")
+    .trim();
+
+  if (!aiTitle || aiTitle.length < 2) {
+    aiTitle = fallbackTitle(rawTitle, bodyText);
+  }
+
+  return { title: aiTitle, meta: { note, from: "ai" } };
+}
